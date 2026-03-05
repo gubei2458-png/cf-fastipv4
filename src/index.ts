@@ -1,68 +1,87 @@
-
-import { resolveA } from './dns';
-import { HuaweiDNS } from './huawei';
+import { resolveA } from "./dns";
 
 export interface Env {
-	KEY: string;
-	SECRET: string;
-    HUAWEI_DNS_ENDPOINT?: string;
-    PROJECT_ID?: string;
+  CF_API_TOKEN: string;   // secret
+  CF_ZONE_ID: string;     // e.g. 70ead...
+  CF_RECORD_NAME: string; // e.g. www.xymianliao.xy
+  SOURCE_DOMAIN?: string; // e.g. cf.090227.xyz
+  IP_COUNT?: string;      // e.g. 3
+  PROXIED?: string;       // "true" / "false"
 }
 
-async function handleCron(env: Env) {
-    console.log('Starting Cron Job...');
-    
-    if (!env.KEY || !env.SECRET) {
-        console.error('Missing KEY or SECRET environment variables.');
-        return;
-    }
+async function cfApi(env: Env, path: string, init?: RequestInit) {
+  return fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+  });
+}
 
-    const sourceDomain = 'cf.090227.xyz';
-    const targetDomain = 'cf.hw.072103.xyz';
+async function updateCloudflareARecords(env: Env, ips: string[]) {
+  const zoneId = env.CF_ZONE_ID;
+  const name = env.CF_RECORD_NAME;
+  const proxied = (env.PROXIED ?? "true").toLowerCase() === "true";
 
-    // 1. Resolve IPs
-    console.log(`Resolving IPs for ${sourceDomain}...`);
-    const ips = await resolveA(sourceDomain);
-    if (ips.length === 0) {
-        console.error('No IPs found from source domain. Aborting update.');
-        return;
-    }
-    console.log(`Got ${ips.length} IPs:`, ips);
+  // list existing A records for this name
+  const listResp = await cfApi(
+    env,
+    `/zones/${zoneId}/dns_records?type=A&name=${encodeURIComponent(name)}`
+  );
+  const listJson: any = await listResp.json();
+  if (!listJson.success) throw new Error(`List DNS failed: ${JSON.stringify(listJson.errors)}`);
 
-    // 2. Update Huawei DNS
-    const endpoint = env.HUAWEI_DNS_ENDPOINT || 'dns.myhuaweicloud.com';
-    const huawei = new HuaweiDNS(env.KEY, env.SECRET, endpoint, env.PROJECT_ID);
-    try {
-        await huawei.updateRecord(targetDomain, ips);
-    } catch (e) {
-        console.error('Failed to update Huawei DNS:', e);
-    }
-    
-    console.log('Cron Job Finished.');
+  // delete old A records
+  for (const r of listJson.result || []) {
+    await cfApi(env, `/zones/${zoneId}/dns_records/${r.id}`, { method: "DELETE" });
+  }
+
+  // create new A records
+  for (const ip of ips) {
+    const createResp = await cfApi(env, `/zones/${zoneId}/dns_records`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: "A",
+        name,
+        content: ip,
+        ttl: 60,
+        proxied,
+      }),
+    });
+    const createJson: any = await createResp.json();
+    if (!createJson.success) throw new Error(`Create DNS failed: ${JSON.stringify(createJson.errors)}`);
+  }
+}
+
+async function run(env: Env) {
+  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID || !env.CF_RECORD_NAME) {
+    throw new Error("Missing CF_API_TOKEN / CF_ZONE_ID / CF_RECORD_NAME");
+  }
+
+  const sourceDomain = env.SOURCE_DOMAIN || "cf.090227.xyz";
+  const ipCount = Math.max(1, Math.min(10, Number(env.IP_COUNT || "3")));
+
+  const ips = await resolveA(sourceDomain);
+  if (!ips.length) throw new Error(`No A records resolved from ${sourceDomain}`);
+
+  const selected = ips.slice(0, ipCount);
+  await updateCloudflareARecords(env, selected);
+  return selected;
 }
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(request.url);
-        
-        // Manual trigger endpoint
-        if (url.pathname === '/trigger') {
-            await handleCron(env);
-            return new Response('Manual trigger executed. Check logs.');
-        }
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/trigger") {
+      const selected = await run(env);
+      return new Response(`OK. Updated ${env.CF_RECORD_NAME} with: ${selected.join(", ")}`);
+    }
+    return new Response("Worker running. Use /trigger");
+  },
 
-		return new Response(`
-CF-FastIPv4 Worker
-------------------
-Status: Running
-Schedule: * * * * * (Every minute)
-
-Usage:
-  GET /trigger  - Manually trigger the update
-        `);
-	},
-
-	async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-		ctx.waitUntil(handleCron(env));
-	},
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(run(env).then(() => undefined));
+  },
 };
