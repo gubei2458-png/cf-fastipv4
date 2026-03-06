@@ -74,10 +74,21 @@ async function run(env: Env) {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // 微信验证文件
+    if (url.pathname === "/ac9b8bf2370e83ad8c95345905cbedf1.txt") {
+      return new Response("0936ac956094a205679411f55ea23b00bea4cb8b", {
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+        },
+      });
+    }
+
     if (url.pathname === "/trigger") {
       const selected = await run(env);
       return new Response(`OK. Updated ${env.CF_RECORD_NAME} with: ${selected.join(", ")}`);
     }
+
     return new Response("Worker running. Use /trigger");
   },
 
